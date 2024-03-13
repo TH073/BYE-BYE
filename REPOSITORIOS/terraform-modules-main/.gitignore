@@ -1,0 +1,6 @@
+**/.terraform**/**
+**/credentials/**
+**/tfplan.out
+**/.terraform.lock.hcl
+**/*.tfvars
+**/terraform.tfstate

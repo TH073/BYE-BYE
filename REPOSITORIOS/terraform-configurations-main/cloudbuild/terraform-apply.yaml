@@ -1,0 +1,81 @@
+steps:
+  - name: 'gcr.io/cloud-builders/git'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        tag_num=$(cat "projects/${_PROJECT_ID}/${_MODULE}.tfvars" | grep '#tf_modules_tag' | sed 's/#tf_modules_tag = //')
+        tag="v${tag_num}_${_MODULE}"
+        git clone https://$$GH_TK@github.com/NBN23dev/terraform-modules.git
+        cd terraform-modules
+        echo "Moving to target tag: ${tag}"
+        git checkout "${tag}"
+    secretEnv: ['GH_TK']
+    id: clone_tf_modules
+
+  - name: 'europe-west1-docker.pkg.dev/nbn23-terraform/core/gcloud-custom:1.0'
+    entrypoint: "bash"
+    args:
+        - '-c'
+        - |
+          cd terraform-modules/$_MODULE
+          [[ ! -d credentials ]] && mkdir credentials
+
+          if [[ $_MODULE = "project" || $_MODULE = "organization_iam" ]]
+          then
+              echo $$ADMIN_SA_KEY | base64 -d | jq > credentials/credentials.json
+          else
+              echo $$OPERATOR_SA_KEY | base64 -d | jq > credentials/credentials.json
+          fi
+          
+          if [[ ${_PROJECT_ID} == "nbn23-terraform" || ${_PROJECT_ID} == "nbn23-competition-manager" || ${_PROJECT_ID} == "nbn23-kms" || ${_PROJECT_ID} == "fiba-app-pro" || ${_PROJECT_ID} == "organization" ]]
+          then 
+            echo "nbn23-tfstate-admin" > bucket_name.txt;
+          else
+            echo "nbn23-tfstate-beta" > bucket_name.txt;
+          fi
+          
+          cp "../../projects/${_PROJECT_ID}/${_MODULE}.tfvars" .
+          gsutil cp gs://$(cat bucket_name.txt)/${_PROJECT_ID}/${_MODULE}.out ${_MODULE}.out
+    secretEnv: ['ADMIN_SA_KEY','OPERATOR_SA_KEY']
+    id: download_credentials 
+
+  - name: 'hashicorp/terraform:1.4'
+    entrypoint: "sh"
+    args:
+        - '-c'
+        - |
+          cd terraform-modules/$_MODULE
+          terraform init --backend-config=bucket=$(cat bucket_name.txt) --backend-config=prefix=${_PROJECT_ID} --backend-config=credentials=credentials/credentials.json
+          if [[ $(terraform workspace list | grep ${_MODULE}) != "" ]] 
+          then 
+            echo "Changing workspace to ${_MODULE}"
+            terraform workspace select $_MODULE
+          else
+            echo "ERROR - workspace does not exist"
+            exit 1
+          fi
+          
+          echo "Terraform apply is about to start:"
+          terraform apply -auto-approve "${_MODULE}".out 
+          echo $? > stdout.txt
+
+          if [ $(cat stdout.txt) -eq 0 ] 
+          then
+            echo "Everything went well, terraform apply has been correctly applied"
+          else
+            echo "Something happened, ERROR CODE is $(cat stdout.txt)"
+            exit 1
+          fi
+    id: terraform 
+availableSecrets:
+  secretManager:
+  - versionName: projects/nbn23-terraform/secrets/nbn23-terraform-github-token/versions/1
+    env: 'GH_TK'
+  - versionName: projects/nbn23-terraform/secrets/tf-admin/versions/1
+    env: 'ADMIN_SA_KEY'
+  - versionName: projects/nbn23-terraform/secrets/tf-operator/versions/1
+    env: 'OPERATOR_SA_KEY'
+options:
+  workerPool: "projects/nbn23-terraform/locations/europe-west1/workerPools/private-worker-pool"
+logsBucket: 'gs://nbn23-terraform_cloudbuild'

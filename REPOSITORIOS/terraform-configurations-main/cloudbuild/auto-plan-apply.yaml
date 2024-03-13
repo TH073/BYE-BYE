@@ -1,0 +1,99 @@
+steps:
+  - name: 'europe-west1-docker.pkg.dev/nbn23-terraform/core/gcloud-custom:1.0'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        git clone https://$$GH_TK@github.com/NBN23dev/terraform-modules.git
+        cd terraform-modules/$_MODULE
+        [[ ! -d credentials ]] && mkdir credentials
+        echo $$SA_KEY | base64 -d | jq > credentials/credentials.json
+    secretEnv: ['SA_KEY','GH_TK']
+    id: credentials 
+
+# Cloning terraform-configurations is mandatory: needed to check repo history
+# The for loop is mandatory: if multiple files are modified multiple plan and applys will be done.
+  - name: 'hashicorp/terraform:1.4'
+    entrypoint: "sh"
+    args:
+        - '-c'
+        - |
+          git clone https://$$GH_TK@github.com/NBN23dev/terraform-configurations.git
+          cd terraform-configurations
+          commits=$(git log -2 --merges | grep commit | sed 's/commit //')
+          git diff $commits | grep diff | grep $_MODULE.tfvars | sed 's/diff --git a//' | sed 's/${_MODULE}.tfvars.*//' | sed 's/projects//' | sed 's/\/*//g' > ../projects.txt
+          cd ..
+          cat projects.txt
+          for project in $(cat projects.txt); do
+
+              if [[ ${project} == "nbn23-terraform" || ${project} == "nbn23-competition-manager" || ${project} == "nbn23-kms" || ${project} == "fiba-app-pro" || ${project} == "nbn23-cdp" ]]
+              then 
+                bucket_name="nbn23-tfstate-admin";
+                echo ""
+                echo "The following plan and apply will refer to $project"
+                echo ""
+              elif [[ ${project} == "fiba-app-qa" || ${project} == "nbn23-competition-manager-dev" || ${project} == "nbn23-competition-manager-stg" ]];
+              then
+                bucket_name="nbn23-tfstate-beta";
+                echo ""
+                echo "The following plan and apply will refer to $project"
+                echo ""
+              else 
+                echo "ERROR: $project is not a valid project id."
+                exit 1
+              fi
+
+              cd terraform-modules/$_MODULE
+              cp "../../terraform-configurations/projects/${project}/${_MODULE}.tfvars" .
+
+              tag_num=$(cat "${_MODULE}.tfvars" | grep '#tf_modules_tag' | sed 's/#tf_modules_tag = //')
+              tag="v${tag_num}_${_MODULE}"
+              if [[ $(git tag | grep "${tag}") != "${tag}" ]]; then
+                  echo "The tag ${tag} does not exist."; exit 1
+              fi
+              git checkout $tag
+
+              terraform init --backend-config="bucket=${bucket_name}" --backend-config="prefix=${project}" --backend-config="credentials=credentials/credentials.json" -reconfigure
+
+              echo "Changing workspace to ${_MODULE}"
+              terraform workspace select -or-create=true "${_MODULE}"
+
+              echo "Terraform plan of project ${project} is about to start:"
+              terraform plan -var-file="${_MODULE}".tfvars -detailed-exitcode -out ${_MODULE}.out
+
+              echo $? > stdout.txt
+
+              if [ $(cat stdout.txt) -eq 2 ]; then
+                echo "Changes appeared in the terraform plan of project ${project}. "
+                echo "Terraform apply is about to start:"
+                terraform apply -auto-approve "${_MODULE}".out 
+                echo $? > stdout.txt
+              elif [ $(cat stdout.txt) -eq 0 ]; then
+                echo "Apply not needed since there are no changes in the configuration of project ${project}."
+              else
+                echo "Something happened during terraform plan, ERROR CODE is $(cat stdout.txt)"
+                exit 1
+              fi
+    
+              if [ $(cat stdout.txt) -eq 0 ]
+              then
+                echo "Everything went well, terraform apply has been correctly applied in project ${project}"
+              else
+                echo "Something happened during terraform apply for project ${project}, ERROR CODE is $(cat stdout.txt)"
+                exit 1
+              fi
+              cd ../..
+          done
+    secretEnv: ['GH_TK']
+    id: terraform_plan
+availableSecrets:
+  secretManager:
+  - versionName: projects/nbn23-terraform/secrets/nbn23-terraform-github-token/versions/1
+    env: 'GH_TK'
+  - versionName: projects/nbn23-terraform/secrets/tf-operator/versions/1
+    env: 'SA_KEY'
+substitutions:
+  _MODULE: sa
+options:
+  workerPool: "projects/nbn23-terraform/locations/europe-west1/workerPools/private-worker-pool"
+logsBucket: 'gs://nbn23-terraform_cloudbuild'

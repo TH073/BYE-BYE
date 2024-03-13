@@ -1,0 +1,150 @@
+steps:
+
+  - name: 'gcr.io/cloud-builders/git'
+    entrypoint: "/bin/bash"
+    args:       
+      - "-c"
+      - |
+        echo "Source project name: ${_PROJECT_ID}"
+        echo "Source module: ${_MODULE}"
+
+        allowed_projects=("nbn23-competition-manager" "nbn23-terraform" "nbn23-cdp" "nbn23-kms" "nbn23-competition-manager-dev" "nbn23-competition-manager-stg" "control-panel-03112022" "fiba-app-qa" "fiba-app-pro" "organization")
+
+        found=false
+        for project in "${allowed_projects[@]}"; do
+            if [[ "$_PROJECT_ID" == "$project" ]]; then
+                found=true
+                break
+            fi
+        done
+
+        if [[ "$found" == false ]]; then
+            echo "ERROR: $_PROJECT_ID is not a valid id."
+            exit 1
+        else
+            echo "$_PROJECT_ID is a valid id."
+        fi
+
+    id: validate_project
+
+  - name: 'gcr.io/cloud-builders/git'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        tag_num=$(cat "projects/${_PROJECT_ID}/${_MODULE}.tfvars" | grep '#tf_modules_tag' | sed 's/#tf_modules_tag = //')
+        tag="v${tag_num}_${_MODULE}"
+
+        git clone https://$$GH_TK@github.com/NBN23dev/terraform-modules.git
+        cd terraform-modules
+        
+        echo "Validating that the module exists inside terraform-modules repository"
+        mods=$(ls -d */)
+        IFS='/'
+        
+        exists="false"
+        for i in ${mods[@]}; do 
+            if [[ "${i//[$'\n']}" == "${_MODULE}" ]]; then
+              exists="true"; break 
+            fi
+        done
+        
+        if [ "${exists}" == "false" ]
+        then
+          echo "ERROR: The tag doesn't reference any existing module."
+          exit 1
+        fi
+
+        echo "The module ${_MODULE} exists inside terraform-modules."
+
+        tag_repo=$(git tag | grep "${tag}")
+        if [[ "${tag_repo}" != "${tag}" ]] 
+        then
+         echo "The tag ${tag_num} does not exist."
+         exit 1
+        fi
+
+        echo "Moving to target tag: ${tag}"
+        git checkout "${tag}"
+
+    secretEnv: ['GH_TK']
+    id: verify_module
+
+  - name: 'europe-west1-docker.pkg.dev/nbn23-terraform/core/gcloud-custom:1.0'
+    entrypoint: "bash"
+    args:
+        - '-c'
+        - |
+
+          cd terraform-modules/$_MODULE
+          [[ ! -d credentials ]] && mkdir credentials
+
+          if [[ $_MODULE = "project" || $_MODULE = "organization_iam" ]]
+          then
+              echo $$ADMIN_SA_KEY | base64 -d | jq > credentials/credentials.json
+          else
+              echo $$OPERATOR_SA_KEY | base64 -d | jq > credentials/credentials.json
+          fi
+          
+    secretEnv: ['ADMIN_SA_KEY','OPERATOR_SA_KEY']
+    id: download_credentials 
+
+  - name: 'hashicorp/terraform:1.4'
+    entrypoint: "sh"
+    args:
+        - '-c'
+        - |
+
+          if [[ ${_PROJECT_ID} == "nbn23-terraform" || ${_PROJECT_ID} == "nbn23-cdp" || ${_PROJECT_ID} == "nbn23-competition-manager" || ${_PROJECT_ID} == "nbn23-kms" || ${_PROJECT_ID} == "fiba-app-pro" || ${_PROJECT_ID} == "organization" || ${_PROJECT_ID} == "control-panel-03112022" ]]
+          then 
+            bucket_name="nbn23-tfstate-admin"; 
+          else
+            bucket_name="nbn23-tfstate-beta";
+          fi
+
+          cd terraform-modules/$_MODULE
+          cp "../../projects/${_PROJECT_ID}/${_MODULE}.tfvars" .
+
+          terraform init --backend-config="bucket=${bucket_name}" --backend-config="prefix=${_PROJECT_ID}" --backend-config="credentials=credentials/credentials.json"
+          
+          echo "Changing workspace to ${_MODULE}"
+          terraform workspace select -or-create=true "${_MODULE}"
+
+          echo "Terraform plan is about to start:"
+
+          terraform plan -var-file="${_MODULE}".tfvars -detailed-exitcode -out ${_MODULE}.out
+
+          echo $? > ../../stdout.txt
+          mv ${_MODULE}.out ../../${_MODULE}.out
+          echo "${_MODULE}.out gs://${bucket_name}/${_PROJECT_ID}/" > ../../plan_cmd.txt
+    id: terraform 
+
+  - name: 'europe-west1-docker.pkg.dev/nbn23-terraform/core/gcloud-custom:1.0'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        if [ $(cat stdout.txt) -eq 2 ]; then
+          echo "Changes appeared in the terraform plan. Launching terraform apply trigger..."
+          gsutil cp $(cat plan_cmd.txt)
+          gcloud builds triggers run Terraform-Apply --project nbn23-terraform --region europe-west1 --substitutions _PROJECT_ID="${_PROJECT_ID}",_MODULE="${_MODULE}" 
+        
+        elif [ $(cat stdout.txt) -eq 0 ]; then
+          echo "Apply not needed since there are no changes in the configuration."
+        else
+          echo "Something happened, ERROR CODE is: $(cat stdout.txt)"
+          exit 1
+        fi
+        rm -rf credentials
+    id: trigger_apply
+availableSecrets:
+  secretManager:
+  - versionName: projects/nbn23-terraform/secrets/nbn23-terraform-github-token/versions/1
+    env: 'GH_TK'
+  - versionName: projects/nbn23-terraform/secrets/tf-admin/versions/1
+    env: 'ADMIN_SA_KEY'
+  - versionName: projects/nbn23-terraform/secrets/tf-operator/versions/1
+    env: 'OPERATOR_SA_KEY'
+options:
+  workerPool: "projects/nbn23-terraform/locations/europe-west1/workerPools/private-worker-pool"
+logsBucket: 'gs://nbn23-terraform_cloudbuild'
